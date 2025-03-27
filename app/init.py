@@ -8,7 +8,7 @@ from app.models import Card, Player, Game
 load_dotenv()
 
 # API URLs
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_BASE_URL = "http://192.168.43.238:8000"  # Updated to use the dealer API
 PING_URL = f"{API_BASE_URL}/ping"
 SHOW_CARDS_URL = f"{API_BASE_URL}/show-cards"
 SHOW_POT_URL = f"{API_BASE_URL}/show-pot"
@@ -18,7 +18,7 @@ PLAYER_ACTION_URL = f"{API_BASE_URL}/player-action"
 _game = None
 
 # Define DEALER_API_URL
-DEALER_API_URL = "http://127.0.0.1:8002"
+DEALER_API_URL = "http://192.168.43.238:8000"  # Updated to use the dealer API
 
 def get_game():
     """Get the current active game or create a new one if none exists"""

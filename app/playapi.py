@@ -2,10 +2,44 @@ from fastapi import APIRouter, HTTPException, Path, Body, Depends, Query
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel
 from app.models import Card, Player, Game, GameStatusResponse
-from app.init import get_game, initialize_game, find_player_by_name, get_game_status
+from app.init import get_game, initialize_game, find_player_by_name, get_game_status, API_BASE_URL, DEALER_API_URL
 import json
+import requests  # Add this import for making HTTP requests
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Define dealer API URL for use in this file
+DEALER_API = DEALER_API_URL  # Use the URL from init.py
+
+# Helper function for making API calls to dealer
+def call_dealer_api(endpoint, method="GET", data=None):
+    """Make API calls to the dealer with error handling"""
+    url = f"{DEALER_API}/{endpoint.lstrip('/')}"
+    try:
+        if method.upper() == "GET":
+            response = requests.get(url, timeout=10)
+        elif method.upper() == "POST":
+            response = requests.post(url, json=data, timeout=10)
+        else:
+            logger.error(f"Unsupported HTTP method: {method}")
+            return {"error": "Unsupported HTTP method"}
+            
+        response.raise_for_status()  # Raise exception for 4XX/5XX responses
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API call failed: {str(e)}")
+        return {"error": f"Failed to connect to dealer: {str(e)}"}
+    except json.JSONDecodeError:
+        logger.error("Failed to parse response from dealer")
+        return {"error": "Invalid response from dealer"}
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        return {"error": f"Unexpected error: {str(e)}"}
 
 # Request models
 class PlayerActionRequest(BaseModel):
@@ -45,77 +79,112 @@ HAND_RANKINGS = {
 @router.get("/ping")
 def ping():
     """Simple endpoint to check if the server is running"""
-    return {"message": "pong"}
+    # Try to ping the dealer as well
+    try:
+        dealer_response = call_dealer_api("ping")
+        if "error" in dealer_response:
+            return {"message": "pong", "dealer_status": "unavailable", "error": dealer_response["error"]}
+        return {"message": "pong", "dealer_status": "available", "dealer_response": dealer_response}
+    except Exception as e:
+        logger.error(f"Error pinging dealer: {str(e)}")
+        return {"message": "pong", "dealer_status": "error", "error": str(e)}
 
 # Fix for the community-cards endpoint (hyphen vs underscore issue)
 @router.get("/community_cards")
 def community_cards():
     """Endpoint to show the community cards"""
-    game = get_game()
-    
-    # Initialize community cards if not set
-    if not hasattr(game, "community_cards") or game.community_cards is None:
-        game.community_cards = []
-    
-    # Deal community cards if needed
-    if len(game.community_cards) == 0 and hasattr(game, "deck") and game.deck:
-        # Deal 5 community cards (flop, turn, river)
-        for _ in range(5):
-            if game.deck and len(game.deck) > 0:
-                card = game.deck.pop(0)
-                game.community_cards.append(card)
-    
-    return {
-        "stage": getattr(game, "current_stage", "pre_flop"),
-        "community_cards": [{"rank": card.rank, "suit": card.suit, "name": card.name} 
-                           for card in game.community_cards]
-    }
+    try:
+        # Try to get community cards from dealer first
+        dealer_response = call_dealer_api("community_cards")
+        
+        # If dealer responds without error, use that response
+        if dealer_response and isinstance(dealer_response, dict) and "error" not in dealer_response:
+            return dealer_response
+            
+        # Fall back to local implementation if dealer fails
+        game = get_game()
+        
+        # Initialize community cards if not set
+        if not hasattr(game, "community_cards") or game.community_cards is None:
+            game.community_cards = []
+        
+        # Deal community cards if needed
+        if len(game.community_cards) == 0 and hasattr(game, "deck") and game.deck:
+            # Deal 5 community cards (flop, turn, river)
+            for _ in range(5):
+                if game.deck and len(game.deck) > 0:
+                    card = game.deck.pop(0)
+                    game.community_cards.append(card)
+        
+        return {
+            "stage": getattr(game, "current_stage", "pre_flop"),
+            "community_cards": [{"rank": card.rank, "suit": card.suit, "name": card.name} 
+                               for card in game.community_cards]
+        }
+    except Exception as e:
+        logger.error(f"Error in community_cards: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # Fix for the show_cards endpoint to ensure cards are dealt
 @router.get("/show_cards")
 def show_cards(player_name: str = Query(...)):
     """Endpoint for a player to view their cards"""
-    game = get_game()
-    
-    # Find the player
-    player = find_player_by_name(player_name)
-    if not player:
-        raise HTTPException(status_code=404, detail=f"Player {player_name} not found")
-    
-    # Activate the game if not active
-    if not game.is_active:
-        game.is_active = True
-    
-    # Deal cards if player doesn't have any
-    if not player.cards or len(player.cards) == 0:
-        # Make sure we have a deck
-        if not hasattr(game, "deck") or not game.deck or len(game.deck) < 2:
-            # Initialize a new deck
-            suits = ["hearts", "diamonds", "clubs", "spades"]
-            ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
-            
-            deck = []
-            for suit in suits:
-                for rank in ranks:
-                    card_name = f"{rank} of {suit.capitalize()}"
-                    deck.append(Card(rank=rank, suit=suit, name=card_name))
-            
-            # Shuffle the deck
-            import random
-            random.shuffle(deck)
-            
-            game.deck = deck
+    try:
+        # Try to get cards from dealer first
+        dealer_response = call_dealer_api(f"show_cards?player_name={player_name}")
         
-        # Deal two cards to the player
-        for _ in range(2):
-            if game.deck:
-                card = game.deck.pop(0)
-                player.cards.append(card)
-    
-    return {
-        "cards": [{"rank": card.rank, "suit": card.suit, "name": card.name} 
-                 for card in player.cards]
-    }
+        # If dealer responds without error, use that response
+        if dealer_response and isinstance(dealer_response, dict) and "error" not in dealer_response:
+            return dealer_response
+            
+        # Fall back to local implementation if dealer fails
+        game = get_game()
+        
+        # Find the player
+        player = find_player_by_name(player_name)
+        if not player:
+            raise HTTPException(status_code=404, detail=f"Player {player_name} not found")
+        
+        # Activate the game if not active
+        if not game.is_active:
+            game.is_active = True
+        
+        # Deal cards if player doesn't have any
+        if not player.cards or len(player.cards) == 0:
+            # Make sure we have a deck
+            if not hasattr(game, "deck") or not game.deck or len(game.deck) < 2:
+                # Initialize a new deck
+                suits = ["hearts", "diamonds", "clubs", "spades"]
+                ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
+                
+                deck = []
+                for suit in suits:
+                    for rank in ranks:
+                        card_name = f"{rank} of {suit.capitalize()}"
+                        deck.append(Card(rank=rank, suit=suit, name=card_name))
+                
+                # Shuffle the deck
+                import random
+                random.shuffle(deck)
+                
+                game.deck = deck
+            
+            # Deal two cards to the player
+            for _ in range(2):
+                if game.deck:
+                    card = game.deck.pop(0)
+                    player.cards.append(card)
+        
+        return {
+            "cards": [{"rank": card.rank, "suit": card.suit, "name": card.name} 
+                     for card in player.cards]
+        }
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Error in show_cards: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.get("/show_pot")
 def show_pot():
@@ -301,118 +370,148 @@ def is_your_turn(player_name: str = Query(...)):
 @router.post("/place_bet")
 def place_bet(request: BetRequest):
     """Endpoint for a player to place a bet"""
-    game = get_game()
-    
-    # Activate game if not active
-    if not game.is_active:
-        game.is_active = True
-    
-    player = find_player_by_name(request.name)
-    if not player:
-        raise HTTPException(status_code=404, detail="Player not found")
-    
-    # Activate player if not active
-    if not player.is_active:
-        player.is_active = True
-    
-    # Initialize turn order if needed
-    if not hasattr(game, "current_turn_order") or not game.current_turn_order:
-        game.current_turn_order = [p.name for p in game.players if p.is_active]
-        game.current_turn_index = 0
-    
-    # Get current bet in the game
-    current_bet = getattr(game, "current_bet", 0)
-    
-    if request.amount <= 0:
-        raise HTTPException(status_code=400, detail="Bet amount must be positive")
-    
-    # Ensure player has enough balance (give them more if needed for testing)
-    if request.amount > player.balance:
-        # For testing purposes, add funds to the player
-        player.balance = max(1000, request.amount * 2)  # Ensure they have enough
-    
-    # Process the bet
-    player.balance -= request.amount
-    player.current_bet = request.amount
-    game.pot += request.amount
-    
-    # Update game's current bet if this is higher
-    if request.amount > current_bet:
-        game.current_bet = request.amount
-        # Reset other players' has_acted status
-        for p in game.players:
-            if p.name != player.name and p.is_active and not getattr(p, "is_all_in", False):
-                p.has_acted = False
-    
-    # Mark player as having acted
-    player.has_acted = True
-    
-    # Move to next player's turn
-    advance_turn(game)
-    
-    return {
-        "message": f"Player {request.name} bet {request.amount}",
-        "player_balance": player.balance,
-        "pot": game.pot,
-        "current_bet": game.current_bet,
-        "next_turn": game.current_turn_order[game.current_turn_index] if game.current_turn_order and game.current_turn_index < len(game.current_turn_order) else None
-    }
+    try:
+        # Try to place bet with dealer first
+        dealer_response = call_dealer_api("place_bet", method="POST", data=request.dict())
+        
+        # If dealer responds without error, use that response
+        if dealer_response and not "error" in dealer_response:
+            return dealer_response
+            
+        # Fall back to local implementation if dealer fails
+        game = get_game()
+        
+        # Activate game if not active
+        if not game.is_active:
+            game.is_active = True
+        
+        player = find_player_by_name(request.name)
+        if not player:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        # Activate player if not active
+        if not player.is_active:
+            player.is_active = True
+        
+        # Initialize turn order if needed
+        if not hasattr(game, "current_turn_order") or not game.current_turn_order:
+            game.current_turn_order = [p.name for p in game.players if p.is_active]
+            game.current_turn_index = 0
+        
+        # Get current bet in the game
+        current_bet = getattr(game, "current_bet", 0)
+        
+        if request.amount <= 0:
+            raise HTTPException(status_code=400, detail="Bet amount must be positive")
+        
+        # Ensure player has enough balance (give them more if needed for testing)
+        if request.amount > player.balance:
+            # For testing purposes, add funds to the player
+            player.balance = max(1000, request.amount * 2)  # Ensure they have enough
+        
+        # Process the bet
+        player.balance -= request.amount
+        player.current_bet = request.amount
+        game.pot += request.amount
+        
+        # Update game's current bet if this is higher
+        if request.amount > current_bet:
+            game.current_bet = request.amount
+            # Reset other players' has_acted status
+            for p in game.players:
+                if p.name != player.name and p.is_active and not getattr(p, "is_all_in", False):
+                    p.has_acted = False
+        
+        # Mark player as having acted
+        player.has_acted = True
+        
+        # Move to next player's turn
+        advance_turn(game)
+        
+        return {
+            "message": f"Player {request.name} bet {request.amount}",
+            "player_balance": player.balance,
+            "pot": game.pot,
+            "current_bet": game.current_bet,
+            "next_turn": game.current_turn_order[game.current_turn_index] if game.current_turn_order and game.current_turn_index < len(game.current_turn_order) else None
+        }
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Error in place_bet: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # Fix the fold endpoint to handle player validation better
 @router.post("/fold")
 def fold(request: FoldRequest):
     """Endpoint for a player to fold"""
-    game = get_game()
-    
-    # Activate game if not active
-    if not game.is_active:
-        game.is_active = True
-    
-    player = find_player_by_name(request.name)
-    if not player:
-        raise HTTPException(status_code=404, detail="Player not found")
-    
-    # Make sure player is active before folding
-    player.is_active = True  # First ensure they're active
-    player.has_acted = True  # Mark as acted
-    
-    # Now fold (set inactive)
-    player.is_active = False
-    
-    # Initialize or update turn order
-    if not hasattr(game, "current_turn_order") or not game.current_turn_order:
-        game.current_turn_order = [p.name for p in game.players if p.is_active]
-        game.current_turn_index = 0
-    elif player.name in game.current_turn_order:
-        idx = game.current_turn_order.index(player.name)
-        game.current_turn_order.remove(player.name)
-        # Adjust current turn index if needed
-        if idx <= game.current_turn_index and game.current_turn_order:
-            game.current_turn_index = game.current_turn_index % len(game.current_turn_order)
-    
-    # Check if only one player is active
-    active_players = [p for p in game.players if p.is_active]
-    if len(active_players) == 1:
-        # Game ends, winner takes the pot
-        winner = active_players[0]
-        winner.balance += game.pot
-        game.pot = 0
+    try:
+        # Try to fold with dealer first
+        dealer_response = call_dealer_api("fold", method="POST", data=request.dict())
+        
+        # If dealer responds without error, use that response
+        if dealer_response and not "error" in dealer_response:
+            return dealer_response
+            
+        # Fall back to local implementation if dealer fails
+        game = get_game()
+        
+        # Activate game if not active
+        if not game.is_active:
+            game.is_active = True
+        
+        player = find_player_by_name(request.name)
+        if not player:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        # Make sure player is active before folding
+        player.is_active = True  # First ensure they're active
+        player.has_acted = True  # Mark as acted
+        
+        # Now fold (set inactive)
+        player.is_active = False
+        
+        # Initialize or update turn order
+        if not hasattr(game, "current_turn_order") or not game.current_turn_order:
+            game.current_turn_order = [p.name for p in game.players if p.is_active]
+            game.current_turn_index = 0
+        elif player.name in game.current_turn_order:
+            idx = game.current_turn_order.index(player.name)
+            game.current_turn_order.remove(player.name)
+            # Adjust current turn index if needed
+            if idx <= game.current_turn_index and game.current_turn_order:
+                game.current_turn_index = game.current_turn_index % len(game.current_turn_order)
+        
+        # Check if only one player is active
+        active_players = [p for p in game.players if p.is_active]
+        if len(active_players) == 1:
+            # Game ends, winner takes the pot
+            winner = active_players[0]
+            winner.balance += game.pot
+            game.pot = 0
+            
+            return {
+                "message": f"Player {request.name} folded. Player {winner.name} wins the pot!",
+                "winner": winner.name,
+                "winner_balance": winner.balance
+            }
+        
+        # Move to next player's turn if there are still active players
+        if active_players:
+            advance_turn(game)
         
         return {
-            "message": f"Player {request.name} folded. Player {winner.name} wins the pot!",
-            "winner": winner.name,
-            "winner_balance": winner.balance
+            "message": f"Player {request.name} folded",
+            "active_players": [p.name for p in active_players],
+            "next_turn": game.current_turn_order[game.current_turn_index] if game.current_turn_order and game.current_turn_index < len(game.current_turn_order) else None
         }
-    
-    # Move to next player's turn if there are still active players
-    if active_players:
-        advance_turn(game)
-    
-    return {
-        "message": f"Player {request.name} folded",
-        "active_players": [p.name for p in active_players],
-        "next_turn": game.current_turn_order[game.current_turn_index] if game.current_turn_order and game.current_turn_index < len(game.current_turn_order) else None
-    }
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Error in fold: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # Fix the compare_cards endpoint - remove the nested is_your_turn endpoint
 @router.post("/compare_cards")
@@ -527,12 +626,21 @@ def determine_winner(game):
 # Add the advance_turn function
 def advance_turn(game):
     """Advance to the next player's turn"""
-    if not game.current_turn_order:
+    if not hasattr(game, "current_turn_order") or not game.current_turn_order:
+        # Initialize turn order if it doesn't exist
+        game.current_turn_order = [p.name for p in game.players if p.is_active]
+        game.current_turn_index = 0
         return
     
     # Safety check - if no active players, don't try to advance
     active_players = [p for p in game.players if p.is_active and not getattr(p, "is_all_in", False)]
     if not active_players:
+        return
+    
+    # Safety check - if turn order is empty, rebuild it
+    if len(game.current_turn_order) == 0:
+        game.current_turn_order = [p.name for p in active_players]
+        game.current_turn_index = 0
         return
     
     # Find next active player who hasn't gone all-in
